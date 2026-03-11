@@ -825,7 +825,7 @@ class NettyClientHandler extends AbstractNettyHandler {
 
   private void registerPendingStreamTrace(int streamId, Http2Headers headers) {
     CharSequence path = safePseudoHeader(headers, Http2Headers.PseudoHeaderName.PATH.value());
-    if (path == null || path.toString().indexOf("Streaming") < 0) {
+    if (path == null || !shouldTracePendingStream(path.toString())) {
       return;
     }
     CharSequence requestId = headers.get(REQUEST_ID_HEADER);
@@ -838,6 +838,10 @@ class NettyClientHandler extends AbstractNettyHandler {
             streamId,
             targetAuthority == null ? authority : targetAuthority.toString());
     pendingClientStreams.put(streamId, trace);
+  }
+
+  private static boolean shouldTracePendingStream(String path) {
+    return path.contains("Streaming") || path.endsWith("/Read");
   }
 
   @Nullable
