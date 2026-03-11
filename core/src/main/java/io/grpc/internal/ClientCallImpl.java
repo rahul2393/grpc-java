@@ -72,6 +72,10 @@ import javax.annotation.Nullable;
 final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
 
   private static final Logger log = Logger.getLogger(ClientCallImpl.class.getName());
+  private static final Logger streamTraceLog =
+      Logger.getLogger(ClientCallImpl.class.getName() + ".streamtrace");
+  private static final Metadata.Key<String> REQUEST_ID_HEADER_KEY =
+      Metadata.Key.of("x-goog-spanner-request-id", Metadata.ASCII_STRING_MARSHALLER);
   private static final byte[] FULL_STREAM_DECOMPRESSION_ENCODINGS
       = "gzip".getBytes(Charset.forName("US-ASCII"));
   private static final double NANO_TO_SECS = 1.0 * TimeUnit.SECONDS.toNanos(1);
@@ -93,6 +97,7 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
   private boolean fullStreamDecompression;
   private DecompressorRegistry decompressorRegistry = DecompressorRegistry.getDefaultInstance();
   private CompressorRegistry compressorRegistry = CompressorRegistry.getDefaultInstance();
+  @Nullable private CallDebugTrace debugTrace;
 
   ClientCallImpl(
       MethodDescriptor<ReqT, RespT> method, Executor executor, CallOptions callOptions,
@@ -240,6 +245,8 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
       compressor = Codec.Identity.NONE;
     }
     prepareHeaders(headers, decompressorRegistry, compressor, fullStreamDecompression);
+      debugTrace =
+          CallDebugTrace.create(method, headers, callOptions.getAuthority(), deadlineCancellationExecutor);
 
     Deadline effectiveDeadline = effectiveDeadline();
     boolean contextIsDeadlineSource = effectiveDeadline != null
@@ -596,6 +603,9 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
 
     @Override
     public void headersRead(final Metadata headers) {
+      if (debugTrace != null) {
+        debugTrace.onHeaders();
+      }
       try (TaskCloseable ignore = PerfMark.traceTask("ClientStreamListener.headersRead")) {
         PerfMark.attachTag(tag);
         final Link link = PerfMark.linkOut();
@@ -632,6 +642,9 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
 
     @Override
     public void messagesAvailable(final MessageProducer producer) {
+      if (debugTrace != null) {
+        debugTrace.onMessage();
+      }
       try (TaskCloseable ignore = PerfMark.traceTask("ClientStreamListener.messagesAvailable")) {
         PerfMark.attachTag(tag);
         final Link link = PerfMark.linkOut();
@@ -688,6 +701,9 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
 
     private void closedInternal(
         Status status, @SuppressWarnings("unused") RpcProgress rpcProgress, Metadata trailers) {
+      if (debugTrace != null) {
+        debugTrace.onClose(status);
+      }
       Deadline deadline = effectiveDeadline();
       if (status.getCode() == Status.Code.CANCELLED && deadline != null) {
         // When the server's deadline expires, it can only reset the stream with CANCEL and no
@@ -779,6 +795,146 @@ final class ClientCallImpl<ReqT, RespT> extends ClientCall<ReqT, RespT> {
 
         callExecutor.execute(new StreamOnReady());
       }
+    }
+  }
+
+  private static final class CallDebugTrace {
+    private static final String PROPERTY_PENDING_THRESHOLD_MILLIS =
+        "io.grpc.internal.pendingCallLogThresholdMillis";
+    private static final String PROPERTY_PENDING_INTERVAL_MILLIS =
+        "io.grpc.internal.pendingCallLogIntervalMillis";
+    private static final String PROPERTY_SLOW_THRESHOLD_MILLIS =
+        "io.grpc.internal.slowCallLogThresholdMillis";
+    private static final long DEFAULT_PENDING_THRESHOLD_MILLIS = 1000L;
+    private static final long DEFAULT_PENDING_INTERVAL_MILLIS = 5000L;
+    private static final long DEFAULT_SLOW_THRESHOLD_MILLIS = 30L;
+
+    private final String methodName;
+    private final String requestId;
+    private final String targetAuthority;
+    private final long createdNanos = System.nanoTime();
+    private final long pendingThresholdNanos =
+        TimeUnit.MILLISECONDS.toNanos(
+            Long.getLong(PROPERTY_PENDING_THRESHOLD_MILLIS, DEFAULT_PENDING_THRESHOLD_MILLIS));
+    private final long pendingIntervalNanos =
+        TimeUnit.MILLISECONDS.toNanos(
+            Long.getLong(PROPERTY_PENDING_INTERVAL_MILLIS, DEFAULT_PENDING_INTERVAL_MILLIS));
+    private final long slowThresholdNanos =
+        TimeUnit.MILLISECONDS.toNanos(
+            Long.getLong(PROPERTY_SLOW_THRESHOLD_MILLIS, DEFAULT_SLOW_THRESHOLD_MILLIS));
+    private final ScheduledExecutorService scheduler;
+
+    @Nullable private ScheduledFuture<?> pendingFuture;
+    private long headersNanos;
+    private long messageNanos;
+    private boolean pendingLogged;
+    private boolean closed;
+
+    @Nullable
+    static <ReqT, RespT> CallDebugTrace create(
+        MethodDescriptor<ReqT, RespT> method,
+        Metadata headers,
+        @Nullable String targetAuthority,
+        ScheduledExecutorService scheduler) {
+      if (method.getType() != MethodType.SERVER_STREAMING) {
+        return null;
+      }
+      String requestId = headers.get(REQUEST_ID_HEADER_KEY);
+      return new CallDebugTrace(method.getFullMethodName(), requestId, targetAuthority, scheduler);
+    }
+
+    private CallDebugTrace(
+        String methodName,
+        @Nullable String requestId,
+        @Nullable String targetAuthority,
+        ScheduledExecutorService scheduler) {
+      this.methodName = methodName;
+      this.requestId = requestId == null ? "unknown" : requestId;
+      this.targetAuthority = targetAuthority == null ? "unknown" : targetAuthority;
+      this.scheduler = scheduler;
+      schedulePending(pendingThresholdNanos);
+    }
+
+    synchronized void onHeaders() {
+      if (headersNanos != 0L) {
+        return;
+      }
+      headersNanos = System.nanoTime();
+      cancelPending();
+      if (pendingLogged || headersNanos - createdNanos >= slowThresholdNanos) {
+        streamTraceLog.log(
+            pendingLogged ? Level.WARNING : Level.FINE,
+            "RequestId={0}: grpc-core headersRead for {1}; elapsedMs={2}; target={3}",
+            new Object[] {requestId, methodName, toMillis(headersNanos - createdNanos), targetAuthority});
+      }
+    }
+
+    synchronized void onMessage() {
+      if (messageNanos != 0L) {
+        return;
+      }
+      messageNanos = System.nanoTime();
+      cancelPending();
+      if (pendingLogged || messageNanos - createdNanos >= slowThresholdNanos) {
+        streamTraceLog.log(
+            pendingLogged ? Level.WARNING : Level.FINE,
+            "RequestId={0}: grpc-core messagesAvailable for {1}; elapsedMs={2}; headersMs={3};"
+                + " target={4}",
+            new Object[] {
+              requestId,
+              methodName,
+              toMillis(messageNanos - createdNanos),
+              headersNanos == 0L ? -1L : toMillis(headersNanos - createdNanos),
+              targetAuthority
+            });
+      }
+    }
+
+    synchronized void onClose(Status status) {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      cancelPending();
+      if (pendingLogged && headersNanos == 0L && messageNanos == 0L) {
+        streamTraceLog.log(
+            Level.WARNING,
+            "RequestId={0}: grpc-core closed before inbound callback for {1}; status={2};"
+                + " elapsedMs={3}; target={4}",
+            new Object[] {
+              requestId, methodName, status, toMillis(System.nanoTime() - createdNanos), targetAuthority
+            });
+      }
+    }
+
+    private synchronized void maybeLogPending() {
+      if (closed || headersNanos != 0L || messageNanos != 0L) {
+        return;
+      }
+      pendingLogged = true;
+      streamTraceLog.log(
+          Level.WARNING,
+          "RequestId={0}: grpc-core still waiting for inbound callback for {1}; elapsedMs={2};"
+              + " target={3}",
+          new Object[] {
+            requestId, methodName, toMillis(System.nanoTime() - createdNanos), targetAuthority
+          });
+      schedulePending(pendingIntervalNanos);
+    }
+
+    private void schedulePending(long delayNanos) {
+      pendingFuture = scheduler.schedule(this::maybeLogPending, delayNanos, TimeUnit.NANOSECONDS);
+    }
+
+    private void cancelPending() {
+      if (pendingFuture != null) {
+        pendingFuture.cancel(false);
+        pendingFuture = null;
+      }
+    }
+
+    private long toMillis(long nanos) {
+      return TimeUnit.NANOSECONDS.toMillis(nanos);
     }
   }
 }

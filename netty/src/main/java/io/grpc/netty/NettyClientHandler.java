@@ -90,9 +90,11 @@ import java.nio.channels.ClosedChannelException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
+import io.netty.util.concurrent.ScheduledFuture;
 
 /**
  * Client-side Netty handler for GRPC processing. All event handlers are executed entirely within
@@ -100,6 +102,9 @@ import javax.annotation.Nullable;
  */
 class NettyClientHandler extends AbstractNettyHandler {
   private static final Logger logger = Logger.getLogger(NettyClientHandler.class.getName());
+  private static final Logger streamTraceLogger =
+      Logger.getLogger(NettyClientHandler.class.getName() + ".streamtrace");
+  private static final CharSequence REQUEST_ID_HEADER = "x-goog-spanner-request-id";
   static boolean enablePerRpcAuthorityCheck =
       GrpcUtil.getFlag("GRPC_ENABLE_PER_RPC_AUTHORITY_CHECK", false);
 
@@ -143,6 +148,7 @@ class NettyClientHandler extends AbstractNettyHandler {
           return size() > 100;
         }
       };
+  private final Map<Integer, PendingClientStreamTrace> pendingClientStreams = new LinkedHashMap<>();
 
   private WriteQueue clientWriteQueue;
   private Http2Ping ping;
@@ -411,6 +417,7 @@ class NettyClientHandler extends AbstractNettyHandler {
   private void onHeadersRead(int streamId, Http2Headers headers, boolean endStream) {
     // Stream 1 is reserved for the Upgrade response, so we should ignore its headers here:
     if (streamId != Http2CodecUtil.HTTP_UPGRADE_STREAM_ID) {
+      markInboundFrame(streamId, "headers");
       NettyClientStream.TransportState stream = clientStream(requireHttp2Stream(streamId));
       PerfMark.event("NettyClientHandler.onHeadersRead", stream.tag());
       // check metadata size vs soft limit
@@ -448,6 +455,7 @@ class NettyClientHandler extends AbstractNettyHandler {
    */
   private void onDataRead(int streamId, ByteBuf data, int padding, boolean endOfStream) {
     flowControlPing().onDataRead(data.readableBytes(), padding);
+    markInboundFrame(streamId, "data");
     NettyClientStream.TransportState stream = clientStream(requireHttp2Stream(streamId));
     PerfMark.event("NettyClientHandler.onDataRead", stream.tag());
     stream.transportDataReceived(data, endOfStream);
@@ -460,6 +468,13 @@ class NettyClientHandler extends AbstractNettyHandler {
    * Handler for an inbound HTTP/2 RST_STREAM frame, terminating a stream.
    */
   private void onRstStreamRead(int streamId, long errorCode) {
+    PendingClientStreamTrace trace = pendingClientStreams.remove(streamId);
+    if (trace != null) {
+      trace.onClosed(
+          "rst_stream_" + errorCode,
+          null,
+          "streamId=" + streamId + ", errorCode=" + errorCode);
+    }
     NettyClientStream.TransportState stream = clientStream(connection().stream(streamId));
     if (stream != null) {
       PerfMark.event("NettyClientHandler.onRstStreamRead", stream.tag());
@@ -720,6 +735,7 @@ class NettyClientHandler extends AbstractNettyHandler {
       boolean isGet,
       final boolean shouldBeCountedForInUse,
       final ChannelPromise promise) {
+    registerPendingStreamTrace(streamId, headers);
     // Create an intermediate promise so that we can intercept the failure reported back to the
     // application.
     ChannelPromise tempPromise = ctx().newPromise();
@@ -745,6 +761,13 @@ class NettyClientHandler extends AbstractNettyHandler {
                 stream.setHttp2Stream(http2Stream);
                 promise.setSuccess();
               } else {
+                PendingClientStreamTrace trace = pendingClientStreams.remove(streamId);
+                if (trace != null) {
+                  trace.onClosed(
+                      "missing_http2_stream",
+                      null,
+                      "streamId=" + streamId + ", outcome=missing_http2_stream");
+                }
                 // Otherwise, the stream has been cancelled and Netty is sending a
                 // RST_STREAM frame which causes it to purge pending writes from the
                 // flow-controller and delete the http2Stream. The stream listener has already
@@ -757,6 +780,13 @@ class NettyClientHandler extends AbstractNettyHandler {
                 promise.setFailure(status.asRuntimeException());
               }
             } else {
+              PendingClientStreamTrace trace = pendingClientStreams.remove(streamId);
+              if (trace != null) {
+                trace.onClosed(
+                    "create_failure",
+                    future.cause(),
+                    "streamId=" + streamId + ", outcome=create_failure");
+              }
               Throwable cause = future.cause();
               if (cause instanceof StreamBufferingEncoder.Http2GoAwayException) {
                 StreamBufferingEncoder.Http2GoAwayException e =
@@ -790,6 +820,158 @@ class NettyClientHandler extends AbstractNettyHandler {
     Http2Stream http2Stream = connection().stream(streamId);
     if (http2Stream != null) {
       http2Stream.setProperty(streamKey, stream);
+    }
+  }
+
+  private void registerPendingStreamTrace(int streamId, Http2Headers headers) {
+    CharSequence path = safePseudoHeader(headers, Http2Headers.PseudoHeaderName.PATH.value());
+    if (path == null || path.toString().indexOf("Streaming") < 0) {
+      return;
+    }
+    CharSequence requestId = headers.get(REQUEST_ID_HEADER);
+    CharSequence targetAuthority =
+        safePseudoHeader(headers, Http2Headers.PseudoHeaderName.AUTHORITY.value());
+    PendingClientStreamTrace trace =
+        new PendingClientStreamTrace(
+            requestId == null ? "unknown" : requestId.toString(),
+            path.toString(),
+            streamId,
+            targetAuthority == null ? authority : targetAuthority.toString());
+    pendingClientStreams.put(streamId, trace);
+  }
+
+  @Nullable
+  private static CharSequence safePseudoHeader(Http2Headers headers, CharSequence headerName) {
+    try {
+      return headers.get(headerName);
+    } catch (RuntimeException e) {
+      return null;
+    }
+  }
+
+  private void markInboundFrame(int streamId, String inboundType) {
+    PendingClientStreamTrace trace = pendingClientStreams.remove(streamId);
+    if (trace != null) {
+      trace.onInbound(inboundType);
+    }
+  }
+
+  private final class PendingClientStreamTrace {
+    private static final String PROPERTY_PENDING_THRESHOLD_MILLIS =
+        "io.grpc.netty.pendingStreamLogThresholdMillis";
+    private static final String PROPERTY_PENDING_INTERVAL_MILLIS =
+        "io.grpc.netty.pendingStreamLogIntervalMillis";
+    private static final String PROPERTY_SLOW_THRESHOLD_MILLIS =
+        "io.grpc.netty.slowStreamLogThresholdMillis";
+    private static final long DEFAULT_PENDING_THRESHOLD_MILLIS = 1000L;
+    private static final long DEFAULT_PENDING_INTERVAL_MILLIS = 5000L;
+    private static final long DEFAULT_SLOW_THRESHOLD_MILLIS = 30L;
+
+    private final String requestId;
+    private final String path;
+    private final int streamId;
+    private final String targetAuthority;
+    private final long createdNanos = System.nanoTime();
+    private final long pendingThresholdNanos =
+        TimeUnit.MILLISECONDS.toNanos(
+            Long.getLong(PROPERTY_PENDING_THRESHOLD_MILLIS, DEFAULT_PENDING_THRESHOLD_MILLIS));
+    private final long pendingIntervalNanos =
+        TimeUnit.MILLISECONDS.toNanos(
+            Long.getLong(PROPERTY_PENDING_INTERVAL_MILLIS, DEFAULT_PENDING_INTERVAL_MILLIS));
+    private final long slowThresholdNanos =
+        TimeUnit.MILLISECONDS.toNanos(
+            Long.getLong(PROPERTY_SLOW_THRESHOLD_MILLIS, DEFAULT_SLOW_THRESHOLD_MILLIS));
+
+    private ScheduledFuture<?> pendingFuture;
+    private boolean pendingLogged;
+    private boolean closed;
+
+    PendingClientStreamTrace(String requestId, String path, int streamId, String targetAuthority) {
+      this.requestId = requestId;
+      this.path = path;
+      this.streamId = streamId;
+      this.targetAuthority = targetAuthority;
+      schedulePending(pendingThresholdNanos);
+    }
+
+    void onInbound(String inboundType) {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      cancelPending();
+      long elapsedNanos = System.nanoTime() - createdNanos;
+      if (pendingLogged || elapsedNanos >= slowThresholdNanos) {
+        streamTraceLogger.log(
+            pendingLogged ? Level.WARNING : Level.FINE,
+            "RequestId={0}: netty received first inbound {1} for {2}; streamId={3}; elapsedMs={4};"
+                + " target={5}",
+            new Object[] {
+              requestId, inboundType, path, streamId, toMillis(elapsedNanos), targetAuthority
+            });
+      }
+    }
+
+    void onClosed(String outcome, @Nullable Throwable t, String details) {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      cancelPending();
+      if (pendingLogged) {
+        if (t == null) {
+          streamTraceLogger.log(
+              Level.WARNING,
+              "RequestId={0}: netty stream closed before inbound for {1}; {2}; elapsedMs={3};"
+                  + " target={4}",
+              new Object[] {
+                requestId, path, details, toMillis(System.nanoTime() - createdNanos), targetAuthority
+              });
+        } else {
+          streamTraceLogger.log(
+              Level.WARNING,
+              String.format(
+                  "RequestId=%s: netty stream closed before inbound for %s; %s; elapsedMs=%d;"
+                      + " target=%s",
+                  requestId,
+                  path,
+                  details,
+                  toMillis(System.nanoTime() - createdNanos),
+                  targetAuthority),
+              t);
+        }
+      }
+    }
+
+    private void maybeLogPending() {
+      if (closed) {
+        return;
+      }
+      pendingLogged = true;
+      streamTraceLogger.log(
+          Level.WARNING,
+          "RequestId={0}: netty still waiting for inbound frames for {1}; streamId={2};"
+              + " elapsedMs={3}; target={4}",
+          new Object[] {
+            requestId, path, streamId, toMillis(System.nanoTime() - createdNanos), targetAuthority
+          });
+      schedulePending(pendingIntervalNanos);
+    }
+
+    private void schedulePending(long delayNanos) {
+      pendingFuture =
+          ctx().executor().schedule(this::maybeLogPending, delayNanos, TimeUnit.NANOSECONDS);
+    }
+
+    private void cancelPending() {
+      if (pendingFuture != null) {
+        pendingFuture.cancel(false);
+        pendingFuture = null;
+      }
+    }
+
+    private long toMillis(long nanos) {
+      return TimeUnit.NANOSECONDS.toMillis(nanos);
     }
   }
 
