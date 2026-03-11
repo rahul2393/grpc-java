@@ -97,9 +97,11 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Handler;
+import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import org.junit.Before;
@@ -657,6 +659,62 @@ public class NettyClientHandlerTest extends NettyHandlerTestBase<NettyClientHand
           .contains("Debug data: this is a test"));
     } finally {
       logger.removeHandler(handler);
+    }
+  }
+
+  @Test
+  public void pendingStreamLogIncludesSuccessfulHeaderAndDataWrites() throws Exception {
+    final AtomicReference<LogRecord> logRef = new AtomicReference<>();
+    Handler handler = new Handler() {
+      @Override
+      public void publish(LogRecord record) {
+        logRef.set(record);
+      }
+
+      @Override
+      public void flush() {}
+
+      @Override
+      public void close() throws SecurityException {}
+    };
+    Logger logger = Logger.getLogger(NettyClientHandler.class.getName() + ".streamtrace");
+    Level previousLevel = logger.getLevel();
+    String previousThreshold = System.getProperty("io.grpc.netty.pendingStreamLogThresholdMillis");
+    String previousInterval = System.getProperty("io.grpc.netty.pendingStreamLogIntervalMillis");
+    try {
+      System.setProperty("io.grpc.netty.pendingStreamLogThresholdMillis", "1");
+      System.setProperty("io.grpc.netty.pendingStreamLogIntervalMillis", "60000");
+      logger.setLevel(Level.WARNING);
+      grpcHeaders.set(as("x-goog-spanner-request-id"), as("req-1"));
+      grpcHeaders.path(as("/google.spanner.v1.Spanner/Read"));
+      logger.addHandler(handler);
+
+      createStream();
+      enqueue(new SendGrpcFrameCommand(streamTransportState, content(), true));
+      fakeClock().forwardTime(2, TimeUnit.MILLISECONDS);
+
+      assertNotNull(logRef.get());
+      String formatted =
+          MessageFormat.format(logRef.get().getMessage(), logRef.get().getParameters());
+      assertTrue(formatted.contains("RequestId=req-1"));
+      assertTrue(formatted.contains("headersWrittenMs="));
+      assertTrue(formatted.contains("dataWrittenMs="));
+      assertFalse(formatted.contains("headersWrittenMs=-1"));
+      assertFalse(formatted.contains("dataWrittenMs=-1"));
+      assertTrue(formatted.contains("dataBytesWritten="));
+    } finally {
+      logger.removeHandler(handler);
+      logger.setLevel(previousLevel);
+      if (previousThreshold == null) {
+        System.clearProperty("io.grpc.netty.pendingStreamLogThresholdMillis");
+      } else {
+        System.setProperty("io.grpc.netty.pendingStreamLogThresholdMillis", previousThreshold);
+      }
+      if (previousInterval == null) {
+        System.clearProperty("io.grpc.netty.pendingStreamLogIntervalMillis");
+      } else {
+        System.setProperty("io.grpc.netty.pendingStreamLogIntervalMillis", previousInterval);
+      }
     }
   }
 

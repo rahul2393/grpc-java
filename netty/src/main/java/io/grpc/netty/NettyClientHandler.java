@@ -748,6 +748,7 @@ class NettyClientHandler extends AbstractNettyHandler {
               // was canceled via RST_STREAM.
               Http2Stream http2Stream = connection().stream(streamId);
               if (http2Stream != null) {
+                markHeadersWritten(streamId);
                 stream.getStatsTraceContext().clientOutboundHeaders();
                 http2Stream.setProperty(streamKey, stream);
 
@@ -840,6 +841,20 @@ class NettyClientHandler extends AbstractNettyHandler {
     pendingClientStreams.put(streamId, trace);
   }
 
+  private void markHeadersWritten(int streamId) {
+    PendingClientStreamTrace trace = pendingClientStreams.get(streamId);
+    if (trace != null) {
+      trace.onHeadersWritten();
+    }
+  }
+
+  private void markDataWritten(int streamId, int numBytes) {
+    PendingClientStreamTrace trace = pendingClientStreams.get(streamId);
+    if (trace != null) {
+      trace.onDataWritten(numBytes);
+    }
+  }
+
   private static boolean shouldTracePendingStream(String path) {
     return path.contains("Streaming") || path.endsWith("/Read");
   }
@@ -889,6 +904,9 @@ class NettyClientHandler extends AbstractNettyHandler {
     private ScheduledFuture<?> pendingFuture;
     private boolean pendingLogged;
     private boolean closed;
+    private long headersWrittenNanos;
+    private long dataWrittenNanos;
+    private long dataBytesWritten;
 
     PendingClientStreamTrace(String requestId, String path, int streamId, String targetAuthority) {
       this.requestId = requestId;
@@ -909,11 +927,32 @@ class NettyClientHandler extends AbstractNettyHandler {
         streamTraceLogger.log(
             pendingLogged ? Level.WARNING : Level.FINE,
             "RequestId={0}: netty received first inbound {1} for {2}; streamId={3}; elapsedMs={4};"
-                + " target={5}",
+                + " headersWrittenMs={5}; dataWrittenMs={6}; dataBytesWritten={7}; target={8}",
             new Object[] {
-              requestId, inboundType, path, streamId, toMillis(elapsedNanos), targetAuthority
+              requestId,
+              inboundType,
+              path,
+              streamId,
+              toMillis(elapsedNanos),
+              elapsedMillis(headersWrittenNanos),
+              elapsedMillis(dataWrittenNanos),
+              dataBytesWritten,
+              targetAuthority
             });
       }
+    }
+
+    void onHeadersWritten() {
+      if (headersWrittenNanos == 0L) {
+        headersWrittenNanos = System.nanoTime();
+      }
+    }
+
+    void onDataWritten(int numBytes) {
+      if (dataWrittenNanos == 0L) {
+        dataWrittenNanos = System.nanoTime();
+      }
+      dataBytesWritten += numBytes;
     }
 
     void onClosed(String outcome, @Nullable Throwable t, String details) {
@@ -927,20 +966,30 @@ class NettyClientHandler extends AbstractNettyHandler {
           streamTraceLogger.log(
               Level.WARNING,
               "RequestId={0}: netty stream closed before inbound for {1}; {2}; elapsedMs={3};"
-                  + " target={4}",
+                  + " headersWrittenMs={4}; dataWrittenMs={5}; dataBytesWritten={6}; target={7}",
               new Object[] {
-                requestId, path, details, toMillis(System.nanoTime() - createdNanos), targetAuthority
+                requestId,
+                path,
+                details,
+                toMillis(System.nanoTime() - createdNanos),
+                elapsedMillis(headersWrittenNanos),
+                elapsedMillis(dataWrittenNanos),
+                dataBytesWritten,
+                targetAuthority
               });
         } else {
           streamTraceLogger.log(
               Level.WARNING,
               String.format(
                   "RequestId=%s: netty stream closed before inbound for %s; %s; elapsedMs=%d;"
-                      + " target=%s",
+                      + " headersWrittenMs=%d; dataWrittenMs=%d; dataBytesWritten=%d; target=%s",
                   requestId,
                   path,
                   details,
                   toMillis(System.nanoTime() - createdNanos),
+                  elapsedMillis(headersWrittenNanos),
+                  elapsedMillis(dataWrittenNanos),
+                  dataBytesWritten,
                   targetAuthority),
               t);
         }
@@ -955,9 +1004,17 @@ class NettyClientHandler extends AbstractNettyHandler {
       streamTraceLogger.log(
           Level.WARNING,
           "RequestId={0}: netty still waiting for inbound frames for {1}; streamId={2};"
-              + " elapsedMs={3}; target={4}",
+              + " elapsedMs={3}; headersWrittenMs={4}; dataWrittenMs={5};"
+              + " dataBytesWritten={6}; target={7}",
           new Object[] {
-            requestId, path, streamId, toMillis(System.nanoTime() - createdNanos), targetAuthority
+            requestId,
+            path,
+            streamId,
+            toMillis(System.nanoTime() - createdNanos),
+            elapsedMillis(headersWrittenNanos),
+            elapsedMillis(dataWrittenNanos),
+            dataBytesWritten,
+            targetAuthority
           });
       schedulePending(pendingIntervalNanos);
     }
@@ -976,6 +1033,10 @@ class NettyClientHandler extends AbstractNettyHandler {
 
     private long toMillis(long nanos) {
       return TimeUnit.NANOSECONDS.toMillis(nanos);
+    }
+
+    private long elapsedMillis(long eventNanos) {
+      return eventNanos == 0L ? -1L : toMillis(eventNanos - createdNanos);
     }
   }
 
@@ -1008,6 +1069,12 @@ class NettyClientHandler extends AbstractNettyHandler {
     try (TaskCloseable ignore = PerfMark.traceTask("NettyClientHandler.sendGrpcFrame")) {
       PerfMark.attachTag(cmd.stream().tag());
       PerfMark.linkIn(cmd.getLink());
+      promise.addListener(
+          future -> {
+            if (future.isSuccess()) {
+              markDataWritten(cmd.stream().id(), cmd.content().readableBytes());
+            }
+          });
       // Call the base class to write the HTTP/2 DATA frame.
       // Note: no need to flush since this is handled by the outbound flow controller.
       encoder().writeData(ctx, cmd.stream().id(), cmd.content(), 0, cmd.endStream(), promise);
