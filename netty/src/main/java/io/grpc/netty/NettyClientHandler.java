@@ -1069,10 +1069,11 @@ class NettyClientHandler extends AbstractNettyHandler {
     try (TaskCloseable ignore = PerfMark.traceTask("NettyClientHandler.sendGrpcFrame")) {
       PerfMark.attachTag(cmd.stream().tag());
       PerfMark.linkIn(cmd.getLink());
+      int dataBytes = cmd.content().readableBytes();
       promise.addListener(
           future -> {
             if (future.isSuccess()) {
-              markDataWritten(cmd.stream().id(), cmd.content().readableBytes());
+              markDataWritten(cmd.stream().id(), dataBytes);
             }
           });
       // Call the base class to write the HTTP/2 DATA frame.
